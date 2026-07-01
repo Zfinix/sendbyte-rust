@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -45,12 +46,16 @@ pub struct Client {
 }
 
 struct Inner {
-    api_key: String,
     base_url: String,
     http: reqwest::Client,
     max_attempts: u32,
     timeout: Duration,
+    // Precomputed once so the hot path never re-allocates per attempt.
+    auth: HeaderValue,
+    user_agent: HeaderValue,
 }
+
+const JSON_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/json");
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -157,13 +162,11 @@ impl Client {
                 .inner
                 .http
                 .request(method.clone(), &url)
-                .header("authorization", format!("Bearer {}", self.inner.api_key))
-                .header("user-agent", format!("sendbyte-rust/{VERSION}"))
+                .header(AUTHORIZATION, self.inner.auth.clone())
+                .header(USER_AGENT, self.inner.user_agent.clone())
                 .timeout(self.inner.timeout);
             if let Some(payload) = &body {
-                req = req
-                    .header("content-type", "application/json")
-                    .body(payload.clone());
+                req = req.header(CONTENT_TYPE, JSON_CONTENT_TYPE).body(payload.clone());
             }
 
             let res = match req.send().await {
@@ -269,14 +272,22 @@ impl ClientBuilder {
         if self.api_key.starts_with("sk_live_") && !is_secure_base_url(&self.base_url) {
             return Err(Error::insecure_base_url());
         }
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+            .map_err(|_| Error::invalid_api_key())?;
+        // Keep the key out of any header-dumping logs.
+        auth.set_sensitive(true);
+        let user_agent = HeaderValue::from_str(&format!("sendbyte-rust/{VERSION}"))
+            .expect("user agent is always a valid header value");
+
         let http = self.http.unwrap_or_default();
         Ok(Client {
             inner: Arc::new(Inner {
-                api_key: self.api_key,
                 base_url: self.base_url,
                 http,
                 max_attempts: self.max_attempts,
                 timeout: self.timeout,
+                auth,
+                user_agent,
             }),
         })
     }
